@@ -2,6 +2,7 @@ import os
 import requests
 import google.generativeai as genai
 from flask import Flask, request
+import threading # Importamos a ferramenta para trabalho em segundo plano
 
 # --- SUAS CONFIGURAÇÕES (NÃO MUDAM) ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -11,7 +12,7 @@ PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- PERSONA DA SUA IA (EDITÁVEL) ---
+# --- PERSONA E ESTRATÉGIA DE VENDAS (SEU BRIEFING COMPLETO) ---
 instrucao_sistema = """
 [PERSONA E MISSÃO PRINCIPAL]
 Você é "Paulo", um especialista em recuperação de ativos digitais do escritório "Advocacia Michenko". Sua persona é a de um profissional de elite: empático para entender a dor do cliente, mas extremamente confiante, objetivo e com senso de urgência. Sua missão principal é converter leads de "Golpe do PIX" em clientes pagantes, executando um funil de vendas completo. Você deve qualificar, nutrir e fechar, poupando o tempo da equipe de advogados. O escritório atende online em todo o Brasil, mas se perguntarem a localização, diga que a sede fica na Região Metropolitana de Curitiba.
@@ -85,21 +86,11 @@ safety_settings = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest", generation_config=generation_config, safety_settings=safety_settings)
-
-# Histórico de conversas
 conversation_history = {}
+app = Flask(__name__)
 
-# --- LÓGICA DO WEBHOOK (AQUI ESTÁ A CORREÇÃO) ---
-app = Flask(__name__)  # <<< ESSA É A LINHA QUE FALTAVA!
-
-@app.route('/webhook', methods=['GET', 'POST'])
-def webhook():
-    if request.method == 'GET':
-        if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
-            return request.args.get('hub.challenge')
-        return "Verification token mismatch", 403
-    
-    data = request.get_json()
+# --- NOVA FUNÇÃO PARA PROCESSAR A MENSAGEM EM SEGUNDO PLANO ---
+def processar_mensagem(data):
     if data and data.get('object'):
         if (data.get('entry') and
                 data['entry'][0].get('changes') and
@@ -110,6 +101,7 @@ def webhook():
             from_number = message_data['from']
             user_message = message_data['text']['body']
             
+            # Recupera ou inicia o histórico da conversa
             if from_number not in conversation_history:
                 conversation_history[from_number] = model.start_chat(history=[
                     {'role': 'user', 'parts': [instrucao_sistema]},
@@ -120,6 +112,7 @@ def webhook():
             convo.send_message(user_message)
             gemini_response = convo.last.text
             
+            # Lógica de placeholders
             if "##FECHAMENTO##" in gemini_response:
                 gemini_response = gemini_response.replace("##FECHAMENTO##", "")
             elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
@@ -129,8 +122,26 @@ def webhook():
 
             send_whatsapp_message(from_number, gemini_response)
 
+# --- WEBHOOK OTIMIZADO ---
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    if request.method == 'GET':
+        if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
+            return request.args.get('hub.challenge')
+        return "Verification token mismatch", 403
+    
+    # Pega os dados da requisição
+    data = request.get_json()
+    
+    # Inicia o processamento pesado em uma thread separada
+    # para responder '200 OK' para a Meta imediatamente
+    thread = threading.Thread(target=processar_mensagem, args=(data,))
+    thread.start()
+    
+    # Retorna a resposta de sucesso imediatamente
     return "OK", 200
 
+# --- FUNÇÃO DE ENVIO DE MENSAGEM (SEM ALTERAÇÃO) ---
 def send_whatsapp_message(to_number, message):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
