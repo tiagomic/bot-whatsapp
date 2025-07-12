@@ -14,7 +14,7 @@ PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- PERSONA E ESTRATÉGIA DE VENDAS (REFINADA) ---
+# --- PERSONA E ESTRATÉGIA DE VENDAS (COM HONORÁRIOS CORRIGIDOS) ---
 instrucao_sistema = """
 [PERSONA E MISSÃO PRINCIPAL]
 Você é "Paulo", um especialista em recuperação de ativos digitais do escritório "Advocacia Michenko". Sua persona é a de um profissional de elite: empático para entender a dor do cliente, mas extremamente confiante, objetivo e com senso de urgência. Sua missão principal é converter leads de "Golpe do PIX" em clientes pagantes, executando um funil de vendas completo. Você deve qualificar, nutrir e fechar, poupando o tempo da equipe de advogados. O escritório atende online em todo o Brasil, mas se perguntarem a localização, diga que a sede fica na Região Metropolitana de Curitiba.
@@ -55,7 +55,7 @@ Você é "Paulo", um especialista em recuperação de ativos digitais do escrit�
 
 **ETAPA 4: TRATAMENTO DE OBJEÇÕES (ACIONADA QUANDO NECESSÁRIO)**
 * **Se perguntarem "COMO FUNCIONA?":** "Essa é uma ótima pergunta. Nossa metodologia de rastreamento e bloqueio é nosso maior diferencial. Por ser o segredo do nosso trabalho, ela é detalhada exclusivamente para clientes após a formalização. O importante para você saber agora é que ela tem um histórico sólido de resultados."
-* **Se perguntarem "QUANTO CUSTA?":** "Nossa política é de risco compartilhado. Atuamos com base no sucesso, a maior parte dos honorários só é paga se recuperarmos seu dinheiro. Para eu te apresentar a proposta formal, com valores, precisamos apenas da sua confirmação para avançarmos."
+* **Se perguntarem "QUANTO CUSTA?":** "Ótima pergunta, vamos falar sobre o investimento para recuperarmos seu dinheiro. Para mobilizar nossa equipe de especialistas e iniciarmos os procedimentos de rastreamento e bloqueio, atuamos com honorários iniciais de 20% sobre o valor perdido no golpe. Este valor pode ser parcelado para facilitar. A formalização e o pagamento desta entrada são o que nos permite começar a agir no seu caso imediatamente. Podemos avançar para a proposta formal onde detalhamos tudo para você?"
 
 **ETAPA 5: FECHAMENTO (CHAMADA PARA AÇÃO)**
 * **Objetivo:** Conduzir o lead qualificado para a assinatura do contrato.
@@ -92,18 +92,13 @@ app = Flask(__name__)
 # --- FUNÇÃO PARA BAIXAR MÍDIA DO WHATSAPP ---
 def baixar_media(media_id):
     try:
-        # Obter a URL da mídia
         url_get = f"https://graph.facebook.com/v19.0/{media_id}/"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
         response_get = requests.get(url_get, headers=headers)
         response_get.raise_for_status()
         media_url = response_get.json().get("url")
-
         if not media_url:
-            print("Erro: URL da mídia não encontrada.")
             return None
-
-        # Baixar o conteúdo da mídia
         response_download = requests.get(media_url, headers=headers)
         response_download.raise_for_status()
         return response_download.content
@@ -116,7 +111,7 @@ def processar_mensagem(data):
     try:
         message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
         from_number = message_data['from']
-        message_type = message_data['type']
+        message_type = message_data.get('type')
         
         prompt_para_gemini = []
 
@@ -129,34 +124,25 @@ def processar_mensagem(data):
             image_bytes = baixar_media(image_id)
             if image_bytes:
                 imagem = Image.open(io.BytesIO(image_bytes))
-                prompt_para_gemini = [
-                    "Analise a imagem a seguir no contexto de um cliente que pode ter sofrido um golpe. Pode ser um comprovante, um print de conversa ou um documento. Responda de forma útil, seguindo seu fluxo de vendas.", 
-                    imagem
-                ]
+                prompt_para_gemini = ["Analise a imagem a seguir no contexto de um cliente que pode ter sofrido um golpe. Pode ser um comprovante ou um print. Responda de forma útil, seguindo seu fluxo de vendas.", imagem]
             else:
-                send_whatsapp_message(from_number, "Tive um problema para analisar a imagem. Você poderia tentar enviá-la novamente?")
+                send_whatsapp_message(from_number, "Tive um problema para analisar a imagem. Poderia tentar enviá-la novamente?")
                 return
         
         elif message_type == 'audio':
             audio_id = message_data['audio']['id']
             audio_bytes = baixar_media(audio_id)
             if audio_bytes:
-                # O Gemini pode processar áudio diretamente
-                audio_file = genai.upload_file(contents=audio_bytes, mime_type='audio/ogg')
-                prompt_para_gemini = [
-                    "O cliente enviou a mensagem de áudio a seguir. Transcreva o conteúdo e responda apropriadamente, seguindo seu fluxo de vendas.",
-                    audio_file
-                ]
+                audio_file = genai.upload_file(contents=audio_bytes)
+                prompt_para_gemini = ["O cliente enviou a mensagem de áudio a seguir. Transcreva e responda apropriadamente, seguindo seu fluxo de vendas.", audio_file]
             else:
-                send_whatsapp_message(from_number, "Tive um problema para processar seu áudio. Você poderia tentar enviá-lo novamente?")
+                send_whatsapp_message(from_number, "Tive um problema para processar seu áudio. Poderia tentar enviá-lo novamente?")
                 return
         
         else:
-            # Responde a outros tipos de arquivo que não processamos
             send_whatsapp_message(from_number, "Desculpe, no momento só consigo processar mensagens de texto, áudio e imagem.")
             return
 
-        # Continua para o Gemini apenas se houver um prompt válido
         if prompt_para_gemini:
             with history_lock:
                 if from_number not in conversation_history:
@@ -169,7 +155,6 @@ def processar_mensagem(data):
             convo.send_message(prompt_para_gemini)
             gemini_response = convo.last.text
             
-            # Lógica de placeholders
             if "##FECHAMENTO##" in gemini_response:
                 gemini_response = gemini_response.replace("##FECHAMENTO##", "")
             elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
@@ -181,7 +166,6 @@ def processar_mensagem(data):
 
     except Exception as e:
         print(f"ERRO CRÍTICO ao processar mensagem: {e}")
-
 
 # --- WEBHOOK OTIMIZADO ---
 @app.route('/webhook', methods=['GET', 'POST'])
