@@ -3,6 +3,8 @@ import requests
 import google.generativeai as genai
 from flask import Flask, request
 import threading
+import io
+from PIL import Image
 
 # --- SUAS CONFIGURAÇÕES (NÃO MUDAM) ---
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -83,36 +85,102 @@ safety_settings = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
 model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest", generation_config=generation_config, safety_settings=safety_settings)
-
-# Histórico de conversas e o "semáforo" de segurança
 conversation_history = {}
 history_lock = threading.Lock()
 app = Flask(__name__)
 
-# --- FUNÇÃO OTIMIZADA PARA PROCESSAR A MENSAGEM ---
-def processar_mensagem(from_number, user_message):
+# --- FUNÇÃO PARA BAIXAR MÍDIA DO WHATSAPP ---
+def baixar_media(media_id):
     try:
-        with history_lock:
-            if from_number not in conversation_history:
-                conversation_history[from_number] = model.start_chat(history=[
-                    {'role': 'user', 'parts': [instrucao_sistema]},
-                    {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
-                ])
-            convo = conversation_history[from_number]
-        
-        convo.send_message(user_message)
-        gemini_response = convo.last.text
-        
-        if "##FECHAMENTO##" in gemini_response:
-            gemini_response = gemini_response.replace("##FECHAMENTO##", "")
-        elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
-            link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
-            gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
-            gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
+        # Obter a URL da mídia
+        url_get = f"https://graph.facebook.com/v19.0/{media_id}/"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+        response_get = requests.get(url_get, headers=headers)
+        response_get.raise_for_status()
+        media_url = response_get.json().get("url")
 
-        send_whatsapp_message(from_number, gemini_response)
+        if not media_url:
+            print("Erro: URL da mídia não encontrada.")
+            return None
+
+        # Baixar o conteúdo da mídia
+        response_download = requests.get(media_url, headers=headers)
+        response_download.raise_for_status()
+        return response_download.content
+    except requests.exceptions.RequestException as e:
+        print(f"Erro ao baixar mídia: {e}")
+        return None
+
+# --- FUNÇÃO OTIMIZADA PARA PROCESSAR A MENSAGEM ---
+def processar_mensagem(data):
+    try:
+        message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
+        from_number = message_data['from']
+        message_type = message_data['type']
+        
+        prompt_para_gemini = []
+
+        if message_type == 'text':
+            user_message = message_data['text']['body']
+            prompt_para_gemini = [user_message]
+        
+        elif message_type == 'image':
+            image_id = message_data['image']['id']
+            image_bytes = baixar_media(image_id)
+            if image_bytes:
+                imagem = Image.open(io.BytesIO(image_bytes))
+                prompt_para_gemini = [
+                    "Analise a imagem a seguir no contexto de um cliente que pode ter sofrido um golpe. Pode ser um comprovante, um print de conversa ou um documento. Responda de forma útil, seguindo seu fluxo de vendas.", 
+                    imagem
+                ]
+            else:
+                send_whatsapp_message(from_number, "Tive um problema para analisar a imagem. Você poderia tentar enviá-la novamente?")
+                return
+        
+        elif message_type == 'audio':
+            audio_id = message_data['audio']['id']
+            audio_bytes = baixar_media(audio_id)
+            if audio_bytes:
+                # O Gemini pode processar áudio diretamente
+                audio_file = genai.upload_file(contents=audio_bytes, mime_type='audio/ogg')
+                prompt_para_gemini = [
+                    "O cliente enviou a mensagem de áudio a seguir. Transcreva o conteúdo e responda apropriadamente, seguindo seu fluxo de vendas.",
+                    audio_file
+                ]
+            else:
+                send_whatsapp_message(from_number, "Tive um problema para processar seu áudio. Você poderia tentar enviá-lo novamente?")
+                return
+        
+        else:
+            # Responde a outros tipos de arquivo que não processamos
+            send_whatsapp_message(from_number, "Desculpe, no momento só consigo processar mensagens de texto, áudio e imagem.")
+            return
+
+        # Continua para o Gemini apenas se houver um prompt válido
+        if prompt_para_gemini:
+            with history_lock:
+                if from_number not in conversation_history:
+                    conversation_history[from_number] = model.start_chat(history=[
+                        {'role': 'user', 'parts': [instrucao_sistema]},
+                        {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
+                    ])
+                convo = conversation_history[from_number]
+            
+            convo.send_message(prompt_para_gemini)
+            gemini_response = convo.last.text
+            
+            # Lógica de placeholders
+            if "##FECHAMENTO##" in gemini_response:
+                gemini_response = gemini_response.replace("##FECHAMENTO##", "")
+            elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
+                link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
+                gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
+                gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
+
+            send_whatsapp_message(from_number, gemini_response)
+
     except Exception as e:
-        print(f"ERRO ao processar mensagem: {e}")
+        print(f"ERRO CRÍTICO ao processar mensagem: {e}")
 
 
 # --- WEBHOOK OTIMIZADO ---
@@ -130,11 +198,7 @@ def webhook():
                 data['entry'][0]['changes'][0].get('value') and
                 data['entry'][0]['changes'][0]['value'].get('messages')):
             
-            message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
-            from_number = message_data['from']
-            user_message = message_data['text']['body']
-            
-            thread = threading.Thread(target=processar_mensagem, args=(from_number, user_message))
+            thread = threading.Thread(target=processar_mensagem, args=(data,))
             thread.start()
     
     return "OK", 200
