@@ -4,6 +4,7 @@ import google.generativeai as genai
 from flask import Flask, request
 import threading
 import io
+import re # Importamos a ferramenta para encontrar números no texto
 from PIL import Image
 
 # --- SUAS CONFIGURAÇÕES (NÃO MUDAM) ---
@@ -14,7 +15,7 @@ PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- PERSONA E ESTRATÉGIA DE VENDAS (AVANÇADA E REFINADA) ---
+# --- PERSONA E ESTRATÉGIA DE VENDAS (QUALIFICAÇÃO NO CÓDIGO) ---
 instrucao_sistema = """
 [PERSONA E MISSÃO PRINCIPAL]
 Você é "Paulo", um especialista em recuperação de ativos digitais do escritório "Advocacia Michenko". Sua persona é a de um profissional de elite: empático para entender a dor do cliente, mas extremamente confiante, objetivo e com senso de urgência. Sua missão principal é converter leads de "Golpe do PIX" em clientes pagantes, executando um funil de vendas em dois contatos. Você deve qualificar, nutrir, quebrar objeções e fechar a venda.
@@ -41,7 +42,7 @@ Você é "Paulo", um especialista em recuperação de ativos digitais do escrit�
     1. "Olá! Aqui é o Paulo, da Advocacia Michenko. Recebemos seu contato. Para começarmos, qual o seu nome?"
     2. "Obrigado, [Nome]. Lamento pelo ocorrido. Em qual estado você reside?"
     3. "Entendido. E quando exatamente aconteceu o golpe?"
-    4. "Certo. Qual foi o valor exato que você perdeu?"
+    4. "Certo. Qual foi o valor exato que você perdeu?" # O código vai analisar a resposta a esta pergunta.
     5. "Ok. Você chegou a fazer contato com seu banco para tentar a devolução?"
     6. "E um Boletim de Ocorrência (B.O.), você já registrou?"
 
@@ -68,12 +69,24 @@ Você é "Paulo", um especialista em recuperação de ativos digitais do escrit�
 * **Script:** "Ótima decisão. Vou te encaminhar agora o formulário para formalizarmos nosso compromisso e, em seguida, o contrato de honorários para sua segurança. Assim que o sistema confirmar, o núcleo jurídico dará início imediato ao seu caso. [Link do Formulário]"
 
 ---
+**[FLUXO DE DOWNSELL (PARA VALORES < R$ 2000)]**
+* **Instrução para a IA:** Use este fluxo quando o código te instruir que o valor é baixo.
+* **Exemplo:** "Certo, [Nome do Lead], obrigado pela informação. Serei muito direto, pois nosso pilar é a transparência. Para o valor que você perdeu, os custos de uma ação judicial completa não seriam vantajosos para você. Pensando em casos como o seu, nossa equipe criou um guia digital, o 'Resgate do PIX', com o passo a passo exato para você mesmo buscar a recuperação. Por R$ 79,90, você tem acesso a esse conhecimento. Faz sentido para você?"
+* **LÓGICA DE DECISÃO:**
+    * **Se ACEITAR:** "Ótima decisão. É o caminho mais inteligente para o seu caso. [Link de Compra do E-book]. Sucesso na sua recuperação! ##DOWNSELL_CONVERTIDO##"
+    * **Se RECUSAR:** Execute o [FLUXO DE DESCARTE].
+
+---
+**[FLUXO DE DESCARTE]**
+* **Instrução para a IA:** Use este fluxo quando o código te instruir ou o cliente recusar o downsell.
+* **Exemplo:** "Entendido. Nesse caso, minha recomendação honesta é que você concentre seus esforços no registro do B.O. e na contestação direta junto ao seu banco. Desejo de coração que você consiga resolver. Se tiver uma nova questão no futuro, estaremos aqui. ##DESCARTE##"
+
+---
 **[GLOSSÁRIO DE OBJEÇÕES]**
 * **Se o lead disser "Não posso pagar", "Não tenho esse dinheiro":** Use o argumento: "Compreendo perfeitamente sua situação financeira, especialmente agora. Por isso mesmo oferecemos opções de parcelamento flexíveis. Qual valor de parcela ficaria confortável para você? Nosso objetivo é viabilizar a busca pelo seu direito."
 * **Se o lead disser "Vou pensar":** Use o argumento: "Claro. Mas me permita perguntar para te ajudar melhor: sua dúvida é em relação à nossa proposta ou aos honorários? Pergunto com sinceridade, pois não quero que um detalhe que possamos ajustar te impeça de buscar a recuperação do seu dinheiro."
 * **Se o lead disser "Você me dá garantia?":** Use o argumento: "Dou a garantia de que farei tudo que está ao meu alcance legal para provar o seu direito. Nenhum advogado pode prometer um resultado, mas te convido a refletir sobre a alternativa: não fazer nada e doar seu dinheiro ao golpista. Conosco, você tem uma chance real e sólida de reaver o valor e ainda uma indenização."
 * **Para TODAS as outras objeções:** Adapte os argumentos do seu material de apoio, mantendo sempre a persona e as regras de ouro. **NÃO DESISTA.**
-
 """
 
 # Configurações do modelo
@@ -98,9 +111,7 @@ def baixar_media(media_id):
         response_get.raise_for_status()
         media_url = response_get.json().get("url")
         if not media_url:
-            print("Erro: URL da mídia não encontrada.")
             return None
-        
         response_download = requests.get(media_url, headers=headers)
         response_download.raise_for_status()
         return response_download.content
@@ -117,48 +128,76 @@ def processar_mensagem(data):
         
         prompt_para_gemini = []
 
-        if message_type == 'text':
+        with history_lock:
+            if from_number not in conversation_history:
+                # Armazena a conversa e o estado inicial do lead
+                conversation_history[from_number] = {
+                    "convo": model.start_chat(history=[
+                        {'role': 'user', 'parts': [instrucao_sistema]},
+                        {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
+                    ]),
+                    "estado": "coletando_valor" # Estado inicial
+                }
+            
+            convo_data = conversation_history[from_number]
+            convo = convo_data["convo"]
+
+        # LÓGICA DE QUALIFICAÇÃO MOVIDA PARA O CÓDIGO
+        if convo_data["estado"] == "coletando_valor" and message_type == 'text':
             user_message = message_data['text']['body']
-            prompt_para_gemini = [user_message]
-        
-        elif message_type == 'image':
-            image_id = message_data['image']['id']
-            image_bytes = baixar_media(image_id)
-            if image_bytes:
-                imagem = Image.open(io.BytesIO(image_bytes))
-                prompt_para_gemini = ["O cliente enviou a imagem a seguir. Analise-a no contexto da nossa conversa (pode ser um comprovante, documento ou print de tela) e continue o fluxo de vendas.", imagem]
+            # Tenta encontrar um número na mensagem do usuário
+            numeros = re.findall(r'[\d\.,]+', user_message)
+            if numeros:
+                try:
+                    # Limpa e converte o número para float
+                    valor_str = numeros[0].replace('.', '').replace(',', '.')
+                    valor_perdido = float(valor_str)
+                    
+                    if valor_perdido < 2000:
+                        # Se o valor for baixo, força o fluxo de downsell
+                        convo_data["estado"] = "desqualificado"
+                        prompt_para_gemini = [f"O cliente informou que perdeu R$ {valor_perdido:.2f}, que é um valor baixo. Execute o [FLUXO DE DOWNSELL] agora."]
+                    else:
+                        # Se o valor for alto, continua o fluxo normal
+                        convo_data["estado"] = "qualificado"
+                        prompt_para_gemini = [user_message]
+                except (ValueError, IndexError):
+                    # Se não conseguir converter, segue o fluxo normal
+                    prompt_para_gemini = [user_message]
             else:
-                send_whatsapp_message(from_number, "Tive um problema para analisar a imagem. Você poderia tentar enviá-la novamente?")
-                return
-        
-        elif message_type == 'audio':
-            audio_id = message_data['audio']['id']
-            audio_bytes = baixar_media(audio_id)
-            if audio_bytes:
-                # Faz o upload do arquivo de áudio para o Gemini, especificando o mime_type
-                audio_file = genai.upload_file(contents=audio_bytes, mime_type='audio/ogg')
-                prompt_para_gemini = ["O cliente enviou a mensagem de áudio a seguir. Transcreva e responda ao conteúdo, continuando o fluxo de vendas de onde paramos.", audio_file]
-            else:
-                send_whatsapp_message(from_number, "Tive um problema para processar seu áudio. Poderia tentar enviá-lo novamente?")
-                return
-        
+                 prompt_para_gemini = [user_message]
         else:
-            send_whatsapp_message(from_number, "Desculpe, no momento só consigo processar mensagens de texto, áudio e imagem.")
-            return
+            # Lógica para outros tipos de mensagem e estados
+            if message_type == 'text':
+                prompt_para_gemini = [message_data['text']['body']]
+            elif message_type == 'image':
+                image_id = message_data['image']['id']
+                image_bytes = baixar_media(image_id)
+                if image_bytes:
+                    imagem = Image.open(io.BytesIO(image_bytes))
+                    prompt_para_gemini = ["O cliente enviou a imagem a seguir. Analise-a e continue o fluxo de vendas.", imagem]
+                else:
+                    send_whatsapp_message(from_number, "Tive um problema para analisar a imagem. Poderia tentar enviá-la novamente?")
+                    return
+            elif message_type == 'audio':
+                # (Mantendo a lógica de áudio como estava)
+                audio_id = message_data['audio']['id']
+                audio_bytes = baixar_media(audio_id)
+                if audio_bytes:
+                    audio_file = genai.upload_file(contents=audio_bytes, mime_type='audio/ogg')
+                    prompt_para_gemini = ["O cliente enviou a mensagem de áudio a seguir. Transcreva e responda ao conteúdo, continuando o fluxo de vendas.", audio_file]
+                else:
+                    send_whatsapp_message(from_number, "Tive um problema para processar seu áudio. Poderia tentar enviá-lo novamente?")
+                    return
+            else:
+                send_whatsapp_message(from_number, "Desculpe, só consigo processar texto, áudio e imagem.")
+                return
 
         if prompt_para_gemini:
-            with history_lock:
-                if from_number not in conversation_history:
-                    conversation_history[from_number] = model.start_chat(history=[
-                        {'role': 'user', 'parts': [instrucao_sistema]},
-                        {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas em dois contatos."]}
-                    ])
-                convo = conversation_history[from_number]
-            
             convo.send_message(prompt_para_gemini)
             gemini_response = convo.last.text
             
-            # Lógica de placeholders (sem alteração)
+            # Lógica de placeholders
             if "##FECHAMENTO##" in gemini_response:
                 gemini_response = gemini_response.replace("##FECHAMENTO##", "")
             elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
