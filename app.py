@@ -1,5 +1,4 @@
 import os
-import re
 import requests
 import google.generativeai as genai
 from flask import Flask, request
@@ -12,7 +11,7 @@ PHONE_NUMBER_ID = os.getenv('PHONE_NUMBER_ID')
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# --- NOVA PERSONA E ESTRATÉGIA DE VENDAS (SEU BRIEFING COMPLETO) ---
+# --- PERSONA DA SUA IA (EDITÁVEL) ---
 instrucao_sistema = """
 [PERSONA E MISSÃO PRINCIPAL]
 Você é "Paulo", um especialista em recuperação de ativos digitais do escritório "Advocacia Michenko". Sua persona é a de um profissional de elite: empático para entender a dor do cliente, mas extremamente confiante, objetivo e com senso de urgência. Sua missão principal é converter leads de "Golpe do PIX" em clientes pagantes, executando um funil de vendas completo. Você deve qualificar, nutrir e fechar, poupando o tempo da equipe de advogados. O escritório atende online em todo o Brasil, mas se perguntarem a localização, diga que a sede fica na Região Metropolitana de Curitiba.
@@ -77,7 +76,7 @@ Você é "Paulo", um especialista em recuperação de ativos digitais do escrit�
 * **Exemplo:** "Entendido, [Nome do Lead]. Nesse caso, minha recomendação honesta é que você concentre seus esforços no registro do Boletim de Ocorrência e na contestação direta junto ao seu banco. Desejo de coração que você consiga resolver. Se tiver uma nova questão no futuro, estaremos aqui. ##DESCARTE##"
 """
 
-# Configurações do modelo (não mexer)
+# Configurações do modelo
 generation_config = {"temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 2048}
 safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -87,10 +86,12 @@ safety_settings = [
 ]
 model = genai.GenerativeModel(model_name="gemini-1.5-pro-latest", generation_config=generation_config, safety_settings=safety_settings)
 
-# Histórico de conversas para manter o contexto
+# Histórico de conversas
 conversation_history = {}
 
-# --- LÓGICA DO WEBHOOK (NÃO PRECISA MEXER AQUI) ---
+# --- LÓGICA DO WEBHOOK (AQUI ESTÁ A CORREÇÃO) ---
+app = Flask(__name__)  # <<< ESSA É A LINHA QUE FALTAVA!
+
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
@@ -109,30 +110,22 @@ def webhook():
             from_number = message_data['from']
             user_message = message_data['text']['body']
             
-            # Recupera ou inicia o histórico da conversa
             if from_number not in conversation_history:
-                # Inicia a conversa com a instrução do sistema
                 conversation_history[from_number] = model.start_chat(history=[
                     {'role': 'user', 'parts': [instrucao_sistema]},
                     {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
                 ])
 
             convo = conversation_history[from_number]
-            
-            # Envia a mensagem do usuário para o Gemini
             convo.send_message(user_message)
             gemini_response = convo.last.text
             
-            # Lógica para links e dados (PLACEHOLDERS)
             if "##FECHAMENTO##" in gemini_response:
-                # Aqui você integraria com seu sistema para gerar e enviar o link real
-                gemini_response = gemini_response.replace("##FECHAMENTO##", "") # Limpa a tag
-                # Adicionar lógica para notificar a equipe humana aqui
+                gemini_response = gemini_response.replace("##FECHAMENTO##", "")
             elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
-                # Substitui o placeholder pelo link real do seu e-book
-                link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook') # Use uma variável de ambiente para o link
+                link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
                 gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
-                gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "") # Limpa a tag
+                gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
 
             send_whatsapp_message(from_number, gemini_response)
 
