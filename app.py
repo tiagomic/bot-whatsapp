@@ -82,7 +82,6 @@ safety_settings = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
-# AQUI ESTÁ A LINHA CORRIGIDA
 model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest", generation_config=generation_config, safety_settings=safety_settings)
 
 # Histórico de conversas e o "semáforo" de segurança
@@ -92,27 +91,63 @@ app = Flask(__name__)
 
 # --- FUNÇÃO OTIMIZADA PARA PROCESSAR A MENSAGEM ---
 def processar_mensagem(from_number, user_message):
-    with history_lock:
-        if from_number not in conversation_history:
-            conversation_history[from_number] = model.start_chat(history=[
-                {'role': 'user', 'parts': [instrucao_sistema]},
-                {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
-            ])
-        convo = conversation_history[from_number]
-    
-    convo.send_message(user_message)
-    gemini_response = convo.last.text
-    
-    if "##FECHAMENTO##" in gemini_response:
-        gemini_response = gemini_response.replace("##FECHAMENTO##", "")
-    elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
-        link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
-        gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
-        gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
+    try:
+        with history_lock:
+            if from_number not in conversation_history:
+                conversation_history[from_number] = model.start_chat(history=[
+                    {'role': 'user', 'parts': [instrucao_sistema]},
+                    {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
+                ])
+            convo = conversation_history[from_number]
+        
+        convo.send_message(user_message)
+        gemini_response = convo.last.text
+        
+        if "##FECHAMENTO##" in gemini_response:
+            gemini_response = gemini_response.replace("##FECHAMENTO##", "")
+        elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
+            link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
+            gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
+            gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
 
-    send_whatsapp_message(from_number, gemini_response)
+        send_whatsapp_message(from_number, gemini_response)
+    except Exception as e:
+        print(f"ERRO ao processar mensagem: {e}")
+
 
 # --- WEBHOOK OTIMIZADO ---
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    if request.method == 'GET
+    if request.method == 'GET':
+        if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
+            return request.args.get('hub.challenge')
+        return "Verification token mismatch", 403
+    
+    data = request.get_json()
+    if data and data.get('object'):
+        if (data.get('entry') and
+                data['entry'][0].get('changes') and
+                data['entry'][0]['changes'][0].get('value') and
+                data['entry'][0]['changes'][0]['value'].get('messages')):
+            
+            message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
+            from_number = message_data['from']
+            user_message = message_data['text']['body']
+            
+            thread = threading.Thread(target=processar_mensagem, args=(from_number, user_message))
+            thread.start()
+    
+    return "OK", 200
+
+# --- FUNÇÃO DE ENVIO DE MENSAGEM ---
+def send_whatsapp_message(to_number, message):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to_number, "text": {"body": message}}
+    try:
+        requests.post(url, json=payload, headers=headers)
+    except requests.exceptions.RequestException as e:
+        print(f"Erro ao enviar mensagem: {e}")
+
+if __name__ == '__main__':
+    app.run(debug=False)
