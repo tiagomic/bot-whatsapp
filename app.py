@@ -82,4 +82,37 @@ safety_settings = [
     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
 ]
-model = genai.GenerativeModel(model_name="gemini-1.5
+# AQUI ESTÁ A LINHA CORRIGIDA
+model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest", generation_config=generation_config, safety_settings=safety_settings)
+
+# Histórico de conversas e o "semáforo" de segurança
+conversation_history = {}
+history_lock = threading.Lock()
+app = Flask(__name__)
+
+# --- FUNÇÃO OTIMIZADA PARA PROCESSAR A MENSAGEM ---
+def processar_mensagem(from_number, user_message):
+    with history_lock:
+        if from_number not in conversation_history:
+            conversation_history[from_number] = model.start_chat(history=[
+                {'role': 'user', 'parts': [instrucao_sistema]},
+                {'role': 'model', 'parts': ["Entendido. Assumo a persona de Paulo. Estou pronto para iniciar o funil de vendas."]}
+            ])
+        convo = conversation_history[from_number]
+    
+    convo.send_message(user_message)
+    gemini_response = convo.last.text
+    
+    if "##FECHAMENTO##" in gemini_response:
+        gemini_response = gemini_response.replace("##FECHAMENTO##", "")
+    elif "##DOWNSELL_CONVERTIDO##" in gemini_response:
+        link_ebook = os.getenv('LINK_EBOOK', 'https://seulink.com/ebook')
+        gemini_response = gemini_response.replace("[Link de Compra do E-book]", link_ebook)
+        gemini_response = gemini_response.replace("##DOWNSELL_CONVERTIDO##", "")
+
+    send_whatsapp_message(from_number, gemini_response)
+
+# --- WEBHOOK OTIMIZADO ---
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    if request.method == 'GET
